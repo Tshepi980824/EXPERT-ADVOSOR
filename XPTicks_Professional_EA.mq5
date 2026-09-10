@@ -54,9 +54,11 @@ input int    InpStructureSwingStrength       = 3;
 input int    InpStructureConfluencePoints    = 120;
 input int    InpStructureNearWallPoints      = 260;
 input int    InpStructureTrapWidthPoints     = 420;
+input int    InpStructureBiasWallPoints      = 360;
 input int    InpStructureExtremeDanger       = 85;
 input int    InpStructureBlockDanger         = 92;
 input int    InpStructureMinDirectionScore   = 40;
+input int    InpStructureSoftDanger          = 72;
 input double InpImpulseAtrFactor             = 0.22;
 input double InpMinCandleBodyRatio           = 0.55;
 
@@ -92,8 +94,13 @@ bool CandleAnatomyStrong(const int direction);
 bool DetectDisplacementAwayFromWall(const int direction, const double nearestResistance, const double nearestSupport);
 bool DetectSweepReclaim(const int direction, const double nearestResistance, const double nearestSupport);
 bool FindNearestStructureWalls(double &nearestResistance, double &nearestSupport, int &resistanceConfluence, int &supportConfluence);
+bool FindNearestStructureWallsForTimeframes(const ENUM_TIMEFRAMES &tfs[], const int tfCount,
+                                            double &nearestResistance, double &nearestSupport,
+                                            int &resistanceConfluence, int &supportConfluence);
 int CollectSwingLevels(const ENUM_TIMEFRAMES timeframe, const int lookback, const int strength, double &prices[], int &types[], int &weights[]);
 int TimeframeWeight(const ENUM_TIMEFRAMES timeframe);
+bool TriggerStructureConfirm(const int direction, const double supportRef, const double resistanceRef);
+bool HtfBiasConflict(const int direction, const double htfResistance, const double htfSupport);
 void RefreshStructureState();
 
 int OnInit()
@@ -282,6 +289,19 @@ bool EntryProtocolOK(const int direction)
    if(!MarketStructureProtectionOK(direction, zoneStatus, dangerScore))
       return false;
 
+   double nearestResistance = 0.0;
+   double nearestSupport = 0.0;
+   int resistanceConfluence = 0;
+   int supportConfluence = 0;
+   if(FindNearestStructureWalls(nearestResistance, nearestSupport, resistanceConfluence, supportConfluence))
+   {
+      if(!TriggerStructureConfirm(direction, nearestSupport, nearestResistance))
+         return false;
+   }
+
+   if(dangerScore >= InpStructureSoftDanger && !ImpulseConfirmsDirection(direction))
+      return false;
+
    g_structureDirectionLast = direction;
    g_structureDangerLast = dangerScore;
    g_structureZoneStatus = zoneStatus;
@@ -292,6 +312,8 @@ double DirectionScore(const int direction, const double structureDanger)
 {
    double score = 100.0;
    score -= structureDanger * 0.65;
+   if(structureDanger >= InpStructureSoftDanger)
+      score -= 10.0;
    if(ImpulseConfirmsDirection(direction))
       score += 10.0;
    if(CandleAnatomyStrong(direction))
@@ -310,11 +332,12 @@ bool MarketStructureProtectionOK(const int direction, string &zoneStatus, double
    if(dangerScore >= InpStructureBlockDanger)
       return false;
 
+   ENUM_TIMEFRAMES htf[2] = {PERIOD_D1, PERIOD_H4};
    double nearestResistance = 0.0;
    double nearestSupport = 0.0;
    int resistanceConfluence = 0;
    int supportConfluence = 0;
-   if(!FindNearestStructureWalls(nearestResistance, nearestSupport, resistanceConfluence, supportConfluence))
+   if(!FindNearestStructureWallsForTimeframes(htf, 2, nearestResistance, nearestSupport, resistanceConfluence, supportConfluence))
       return true;
 
    double price = (direction > 0) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -327,22 +350,33 @@ bool MarketStructureProtectionOK(const int direction, string &zoneStatus, double
    if(distToHtfWall >= 0.0 && distToHtfWall <= InpStructureNearWallPoints && dangerScore >= InpStructureExtremeDanger)
       return false;
 
+   if(distToHtfWall >= 0.0 && distToHtfWall <= InpStructureBiasWallPoints && HtfBiasConflict(direction, nearestResistance, nearestSupport))
+      return false;
+
    return true;
 }
 
 double MarketStructureDangerScore(const int direction, string &zoneStatus)
 {
    zoneStatus = "NEUTRAL";
-   double nearestResistance = 0.0;
-   double nearestSupport = 0.0;
-   int resistanceConfluence = 0;
-   int supportConfluence = 0;
-   if(!FindNearestStructureWalls(nearestResistance, nearestSupport, resistanceConfluence, supportConfluence))
+   ENUM_TIMEFRAMES htf[2] = {PERIOD_D1, PERIOD_H4};
+   ENUM_TIMEFRAMES battlefield[2] = {PERIOD_H1, PERIOD_M15};
+   double htfResistance = 0.0, htfSupport = 0.0, bfResistance = 0.0, bfSupport = 0.0;
+   int htfResConfluence = 0, htfSupConfluence = 0, bfResConfluence = 0, bfSupConfluence = 0;
+   bool hasHtf = FindNearestStructureWallsForTimeframes(htf, 2, htfResistance, htfSupport, htfResConfluence, htfSupConfluence);
+   bool hasBf = FindNearestStructureWallsForTimeframes(battlefield, 2, bfResistance, bfSupport, bfResConfluence, bfSupConfluence);
+   if(!hasHtf && !hasBf)
       return 0.0;
 
    double price = (direction > 0) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double nearestResistance = (bfResistance > 0.0) ? bfResistance : htfResistance;
+   double nearestSupport = (bfSupport > 0.0) ? bfSupport : htfSupport;
+   int resistanceConfluence = (bfResConfluence > 0) ? bfResConfluence : htfResConfluence;
+   int supportConfluence = (bfSupConfluence > 0) ? bfSupConfluence : htfSupConfluence;
    double distToResistance = (nearestResistance > 0.0) ? ((nearestResistance - price) / _Point) : 1.0e10;
    double distToSupport = (nearestSupport > 0.0) ? ((price - nearestSupport) / _Point) : 1.0e10;
+   double distToHtfResistance = (htfResistance > 0.0) ? ((htfResistance - price) / _Point) : 1.0e10;
+   double distToHtfSupport = (htfSupport > 0.0) ? ((price - htfSupport) / _Point) : 1.0e10;
 
    bool trapped = (distToResistance >= 0.0 && distToSupport >= 0.0 &&
                    (distToResistance + distToSupport) <= InpStructureTrapWidthPoints);
@@ -368,6 +402,8 @@ double MarketStructureDangerScore(const int direction, string &zoneStatus)
          danger += 20.0;
       if(resistanceConfluence >= 8) danger += 22.0;
       else if(resistanceConfluence >= 5) danger += 12.0;
+      if(distToHtfResistance <= InpStructureBiasWallPoints) danger += 14.0;
+      if(htfResConfluence >= 8) danger += 10.0;
    }
 
    if(direction < 0 && distToSupport >= 0.0)
@@ -378,6 +414,8 @@ double MarketStructureDangerScore(const int direction, string &zoneStatus)
          danger += 20.0;
       if(supportConfluence >= 8) danger += 22.0;
       else if(supportConfluence >= 5) danger += 12.0;
+      if(distToHtfSupport <= InpStructureBiasWallPoints) danger += 14.0;
+      if(htfSupConfluence >= 8) danger += 10.0;
    }
 
    if(trapped)
@@ -430,6 +468,14 @@ string MarketStructureClassifyZone(const int direction,
 
 bool FindNearestStructureWalls(double &nearestResistance, double &nearestSupport, int &resistanceConfluence, int &supportConfluence)
 {
+   ENUM_TIMEFRAMES tfs[5] = {PERIOD_D1, PERIOD_H4, PERIOD_H1, PERIOD_M15, PERIOD_M5};
+   return FindNearestStructureWallsForTimeframes(tfs, 5, nearestResistance, nearestSupport, resistanceConfluence, supportConfluence);
+}
+
+bool FindNearestStructureWallsForTimeframes(const ENUM_TIMEFRAMES &tfs[], const int tfCount,
+                                            double &nearestResistance, double &nearestSupport,
+                                            int &resistanceConfluence, int &supportConfluence)
+{
    nearestResistance = 0.0;
    nearestSupport = 0.0;
    resistanceConfluence = 0;
@@ -442,9 +488,8 @@ bool FindNearestStructureWalls(double &nearestResistance, double &nearestSupport
    ArrayResize(types, 0);
    ArrayResize(weights, 0);
 
-   ENUM_TIMEFRAMES tfs[5] = {PERIOD_D1, PERIOD_H4, PERIOD_H1, PERIOD_M15, PERIOD_M5};
    int total = 0;
-   for(int i = 0; i < 5; i++)
+   for(int i = 0; i < tfCount; i++)
       total += CollectSwingLevels(tfs[i], InpStructureSwingLookbackBars, InpStructureSwingStrength, levels, types, weights);
 
    if(total <= 0)
@@ -639,6 +684,54 @@ bool CandleAnatomyStrong(const int direction)
    if(direction > 0)
       return close > open;
    return close < open;
+}
+
+bool TriggerStructureConfirm(const int direction, const double supportRef, const double resistanceRef)
+{
+   double m5Close1 = iClose(_Symbol, PERIOD_M5, 1);
+   double m5Open1 = iOpen(_Symbol, PERIOD_M5, 1);
+   double m1Close0 = iClose(_Symbol, PERIOD_M1, 0);
+   double m1Close1 = iClose(_Symbol, PERIOD_M1, 1);
+   if(m5Close1 <= 0.0 || m5Open1 <= 0.0 || m1Close0 <= 0.0 || m1Close1 <= 0.0)
+      return false;
+
+   if(direction > 0)
+   {
+      bool directional = (m5Close1 > m5Open1 && m1Close0 > m1Close1);
+      if(!directional) return false;
+      if(resistanceRef > 0.0 && ((resistanceRef - m1Close0) / _Point) <= (InpStructureNearWallPoints * 0.4))
+         return false;
+      return true;
+   }
+
+   bool directional = (m5Close1 < m5Open1 && m1Close0 < m1Close1);
+   if(!directional) return false;
+   if(supportRef > 0.0 && ((m1Close0 - supportRef) / _Point) <= (InpStructureNearWallPoints * 0.4))
+      return false;
+   return true;
+}
+
+bool HtfBiasConflict(const int direction, const double htfResistance, const double htfSupport)
+{
+   double d1Close = iClose(_Symbol, PERIOD_D1, 1);
+   double h4Close = iClose(_Symbol, PERIOD_H4, 1);
+   double d1Open = iOpen(_Symbol, PERIOD_D1, 1);
+   double h4Open = iOpen(_Symbol, PERIOD_H4, 1);
+   if(d1Close <= 0.0 || h4Close <= 0.0 || d1Open <= 0.0 || h4Open <= 0.0)
+      return false;
+
+   bool htfBearish = (d1Close < d1Open && h4Close < h4Open);
+   bool htfBullish = (d1Close > d1Open && h4Close > h4Open);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if(direction > 0)
+   {
+      bool nearWall = (htfResistance > 0.0 && ((htfResistance - bid) / _Point) <= InpStructureBiasWallPoints);
+      return htfBearish && nearWall;
+   }
+
+   bool nearWall = (htfSupport > 0.0 && ((bid - htfSupport) / _Point) <= InpStructureBiasWallPoints);
+   return htfBullish && nearWall;
 }
 
 void PlaceOrderBySignal(const int signal)
